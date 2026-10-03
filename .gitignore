@@ -14,3 +14,6 @@ src/GCN/CPU_parallelization/dense_parallelization/dense_cpu
 src/GCN/CUDA/**/program
 results/
 __pycache__
+
+tmp/
+weights/**/h64_l2_seed42/

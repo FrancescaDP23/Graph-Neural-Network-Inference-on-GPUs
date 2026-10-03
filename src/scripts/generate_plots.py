@@ -152,10 +152,18 @@ def parse_profiling_results(root):
     records = []
     for path in sorted(root.glob("src/GCN/**/profiling_result*.txt")):
         section = ""
+        configuration = None
         current = None
         for line_no, line in enumerate(path.read_text(errors="ignore").splitlines(), 1):
             text = line.strip()
             if not text:
+                continue
+            kernel = re.match(r"-+\s*KERNEL:\s*(.+?)\s*-+$", text)
+            if kernel:
+                if current:
+                    records.append(current)
+                current = dict(configuration or {})
+                current["kernel"] = kernel.group(1).strip()
                 continue
             if text.startswith("-"):
                 title = text.strip("- ").strip()
@@ -170,7 +178,8 @@ def parse_profiling_results(root):
             if match:
                 if current:
                     records.append(current)
-                current = {
+                    current = None
+                configuration = {
                     "source_file": str(path.relative_to(root)),
                     "source_line": line_no,
                     "section": section,
@@ -180,11 +189,13 @@ def parse_profiling_results(root):
                     "feature_dim": int(match.group(4)),
                 }
                 continue
-            if current is None:
+            if configuration is None:
                 continue
 
             impl = re.match(r"RESULT implementation:(.+)", text)
             if impl:
+                if current is None:
+                    current = dict(configuration)
                 current["implementation"] = impl.group(1).strip().removesuffix("-profiling")
                 continue
             for key, label in (
@@ -194,9 +205,14 @@ def parse_profiling_results(root):
             ):
                 if text.startswith(label + ":"):
                     value = text.split(":", 1)[1].strip()
-                    current[key] = int(value) if value.isdigit() else value
+                    value = int(value) if value.isdigit() else value
+                    configuration[key] = value
+                    if current is not None:
+                        current[key] = value
             metric = re.match(r"([^:]+):\s*([0-9.]+)%?$", text)
             if metric:
+                if current is None:
+                    current = dict(configuration)
                 current[metric.group(1).strip()] = float(metric.group(2))
         if current:
             records.append(current)
@@ -762,6 +778,183 @@ def plot_gpu_profiling(records, out_dir):
     )
 
 
+def plot_cuda_only(benchmark_records, profiling_records, out_dir):
+    """Generate figures containing CUDA implementations only."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    basic_improved = (
+        ("Vertex basic", "cuda-vertex-basic"),
+        ("Vertex improved", "cuda-vertex-improved"),
+        ("Edge basic", "cuda-edge-parallel-basic"),
+        ("Edge improved", "cuda-edge-parallel-improved"),
+        ("Message basic", "cuda-message-batching-basic"),
+        ("Message improved", "cuda-message-batching-improved"),
+    )
+    for dataset in MAIN_DATASETS:
+        labels, values, colors = [], [], []
+        for label, implementation in basic_improved:
+            record = best_record(
+                benchmark_records, dataset, implementation,
+                section="Confronto architetturale", hidden_dim=64, num_layers=2,
+            )
+            if record:
+                labels.append(label)
+                values.append(float(record["inference_ms"]))
+                colors.append(COLORS[implementation])
+        draw_bar_chart(
+            out_dir / f"cuda_01_basic_improved_{slug(dataset)}.svg",
+            f"CUDA basic and improved implementations - {dataset}",
+            "Inference time, H=64, L=2. Lower is better (logarithmic scale).",
+            labels, values, colors, "inference time (ms)", log_scale=True,
+        )
+
+    improved = (
+        "cuda-vertex-improved",
+        "cuda-edge-parallel-improved",
+        "cuda-message-batching-improved",
+    )
+    strategy_values = {}
+    for dataset in MAIN_DATASETS:
+        strategy_values[dataset] = {}
+        for implementation in improved:
+            record = best_record(
+                benchmark_records, dataset, implementation,
+                section="Confronto architetturale", hidden_dim=64, num_layers=2,
+            )
+            if record:
+                strategy_values[dataset][implementation] = float(record["inference_ms"])
+    draw_grouped_bars(
+        out_dir / "cuda_02_improved_strategy_comparison.svg",
+        "Comparison of improved CUDA strategies",
+        "Inference time, H=64, L=2. Lower is better.",
+        MAIN_DATASETS, improved, strategy_values, "inference time (ms)",
+    )
+
+    scalability = {}
+    for implementation in improved:
+        by_node = {}
+        for record in benchmark_records:
+            if (
+                record.get("implementation") == implementation
+                and record.get("dataset", "").startswith("ErdosRenyi_")
+                and record.get("hidden_dim") == 64
+                and record.get("num_layers") == 2
+                and record.get("section") in {"Scalabilità", "Scalabilità sulla dimensione del grafo"}
+            ):
+                nodes = int(record["nodes"])
+                by_node[nodes] = min(float(record["inference_ms"]), by_node.get(nodes, float("inf")))
+        if by_node:
+            scalability[implementation] = sorted(by_node.items())
+    draw_line_chart(
+        out_dir / "cuda_03_scalability_erdosrenyi.svg",
+        "CUDA scalability on Erdos-Renyi graphs",
+        "Inference time as graph size grows, H=64, L=2.",
+        scalability, "nodes", "inference time (ms)",
+    )
+
+    topology_datasets = ("ErdosRenyi_100k", "BarabasiAlbert_100k", "WattsStrogatz_100k")
+    topology_values = {}
+    for dataset in topology_datasets:
+        topology_values[dataset] = {}
+        for implementation in improved:
+            record = best_record(
+                benchmark_records, dataset, implementation,
+                section="Analisi topologica e skewed degree distribution",
+                hidden_dim=64, num_layers=2,
+            )
+            if record:
+                topology_values[dataset][implementation] = float(record["inference_ms"])
+    draw_grouped_bars(
+        out_dir / "cuda_04_topology_impact.svg",
+        "Topology impact on CUDA implementations",
+        "Graphs of comparable size, H=64, L=2. Lower is better.",
+        topology_datasets, improved, topology_values, "inference time (ms)",
+    )
+
+    for dataset in ("ogbn-arxiv", "BarabasiAlbert_100k"):
+        values = {}
+        for hidden in (64, 128, 256):
+            for layers in (2, 4, 8):
+                record = best_record(
+                    benchmark_records, dataset, "cuda-edge-parallel-improved",
+                    section="Impatto della profondità e dimensione nascosta sul modello",
+                    hidden_dim=hidden, num_layers=layers,
+                )
+                values[(f"H={hidden}", f"L={layers}")] = (
+                    float(record["inference_ms"]) if record else None
+                )
+        draw_heatmap(
+            out_dir / f"cuda_05_hidden_layers_{slug(dataset)}.svg",
+            "Hidden dimension and depth - CUDA edge improved",
+            f"{dataset}. Cell values are inference time in ms.",
+            ("H=64", "H=128", "H=256"), ("L=2", "L=4", "L=8"), values,
+        )
+
+    fp_values = {}
+    fp_series = ("CUDA vertex FP32", "CUDA vertex FP16")
+    for dataset in MAIN_DATASETS:
+        fp_values[dataset] = {}
+        for label, implementation in (
+            (fp_series[0], "cuda-vertex-improved"),
+            (fp_series[1], "cuda-vertex-compressed-fp16"),
+        ):
+            record = best_record(
+                benchmark_records, dataset, implementation,
+                section="Confronto architetturale", hidden_dim=64, num_layers=2,
+            )
+            if record:
+                fp_values[dataset][label] = float(record["device_memory_bytes"]) / (1024.0 * 1024.0)
+    old_colors = {key: COLORS.get(key) for key in fp_series}
+    COLORS.update({fp_series[0]: "#ea580c", fp_series[1]: "#64748b"})
+    draw_grouped_bars(
+        out_dir / "cuda_06_fp16_device_memory.svg",
+        "FP32 and FP16 CUDA device memory",
+        "Improved vertex-parallel implementation, H=64, L=2. Lower is better.",
+        MAIN_DATASETS, fp_series, fp_values, "device memory (MiB)",
+    )
+    for key, value in old_colors.items():
+        if value is None:
+            COLORS.pop(key, None)
+        else:
+            COLORS[key] = value
+
+    profiling_impls = improved
+    for metric, filename, label in (
+        ("Achieved Occupancy", "cuda_07_kernel_occupancy_ogbn_arxiv.svg", "achieved occupancy (%)"),
+        ("SM Throughput", "cuda_08_kernel_sm_throughput_ogbn_arxiv.svg", "SM throughput (%)"),
+        ("DRAM Throughput", "cuda_09_kernel_dram_throughput_ogbn_arxiv.svg", "DRAM throughput (%)"),
+    ):
+        groups = ("Aggregation/layer", "Update", "Softmax")
+        values = {group: {} for group in groups}
+        for implementation in profiling_impls:
+            candidates = [
+                record for record in profiling_records
+                if record.get("section") == "Confronto architetturale"
+                and record.get("dataset") == "ogbn-arxiv"
+                and record.get("implementation") == implementation
+                and record.get("hidden_dim") == 64
+                and record.get("num_layers") == 2
+            ]
+            for record in candidates:
+                kernel = record.get("kernel", "")
+                if "softmax" in kernel:
+                    group = "Softmax"
+                elif "update" in kernel:
+                    group = "Update"
+                elif "aggregate" in kernel or "vertex_layer" in kernel:
+                    group = "Aggregation/layer"
+                else:
+                    continue
+                if metric in record:
+                    values[group][implementation] = float(record[metric])
+        draw_grouped_bars(
+            out_dir / filename,
+            f"CUDA kernel profiling - {metric}",
+            "ogbn-arxiv, H=64, L=2; first profiled invocation of each named kernel.",
+            groups, profiling_impls, values, label,
+        )
+
+
 def write_exclusion_report(path, benchmark_records):
     excluded = [(record, is_excluded(record)) for record in benchmark_records if is_excluded(record)]
     lines = [
@@ -789,7 +982,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=REPOSITORY_ROOT)
     parser.add_argument("--output-dir", type=Path, default=REPOSITORY_ROOT / "results" / "plots")
+    parser.add_argument(
+        "--cuda-only",
+        action="store_true",
+        help="generate only CUDA-specific report figures",
+    )
     args = parser.parse_args()
+    args.root = args.root.resolve()
+    args.output_dir = args.output_dir.resolve()
 
     benchmark_records = parse_benchmark_results(args.root)
     profiling_records = parse_profiling_results(args.root)
@@ -797,20 +997,24 @@ def main():
         parser.error("no benchmark_results.txt files found")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    plot_architecture(benchmark_records, args.output_dir)
-    plot_speedup(benchmark_records, args.output_dir)
-    plot_scalability(benchmark_records, args.output_dir)
-    plot_topology(benchmark_records, args.output_dir)
-    plot_hyperparameters(benchmark_records, args.output_dir)
-    plot_memory(benchmark_records, args.output_dir)
-    plot_gpu_profiling(profiling_records, args.output_dir)
-    write_exclusion_report(args.output_dir / "excluded_points.md", benchmark_records)
+    if args.cuda_only:
+        plot_cuda_only(benchmark_records, profiling_records, args.output_dir)
+    else:
+        plot_architecture(benchmark_records, args.output_dir)
+        plot_speedup(benchmark_records, args.output_dir)
+        plot_scalability(benchmark_records, args.output_dir)
+        plot_topology(benchmark_records, args.output_dir)
+        plot_hyperparameters(benchmark_records, args.output_dir)
+        plot_memory(benchmark_records, args.output_dir)
+        plot_gpu_profiling(profiling_records, args.output_dir)
+        write_exclusion_report(args.output_dir / "excluded_points.md", benchmark_records)
 
     generated = sorted(args.output_dir.glob("*.svg"))
     print(f"Generated {len(generated)} SVG plots in {args.output_dir}")
     for path in generated:
         print(f"  {path.relative_to(args.root)}")
-    print(f"  {(args.output_dir / 'excluded_points.md').relative_to(args.root)}")
+    if not args.cuda_only:
+        print(f"  {(args.output_dir / 'excluded_points.md').relative_to(args.root)}")
 
 
 if __name__ == "__main__":
